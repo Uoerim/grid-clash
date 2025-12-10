@@ -38,6 +38,8 @@ SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 50000
 UPDATE_HZ = 20          # snapshots per second
 GRID_SIZE = 20          # 20x20 grid
+CLIENT_TIMEOUT_MS = 15000   # 15 seconds without heartbeat to mark client offline
+CLEANUP_INTERVAL_S = 1    # Check for dead clients every 1 second
 
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -47,6 +49,7 @@ SERVER_EVENTS_CSV = os.path.join(LOG_DIR, "server_events.csv")
 # ------------ Global state ------------
 clients = set()         # set of (ip, port)
 players = {}            # (ip, port) -> player_id
+player_id_history = {}  # (ip, port) -> player_id (preserved even after timeout)
 next_player_id = 1
 
 snapshot_id = 0
@@ -57,6 +60,9 @@ grid = [0] * (GRID_SIZE * GRID_SIZE)
 
 # per-client set of processed event_ids to avoid double-apply
 processed_events = {}   # (ip, port) -> set(event_id)
+
+# heartbeat tracking: last time we heard from each client
+client_last_seen = {}   # (ip, port) -> timestamp_ms
 
 
 # ------------ Logging ------------
@@ -222,14 +228,23 @@ def handle_client_messages(sock):
             # new or existing client
             if addr not in clients:
                 clients.add(addr)
-                players[addr] = next_player_id
+                # Check if this client was timed out before
+                if addr in player_id_history:
+                    # Restore old player_id
+                    players[addr] = player_id_history[addr]
+                    print(f"[SERVER] Client {addr} re-joined with old player_id {players[addr]}")
+                else:
+                    # Brand new client
+                    players[addr] = next_player_id
+                    player_id_history[addr] = next_player_id
+                    print(f"[SERVER] New client {addr} -> player_id {next_player_id}")
+                    next_player_id += 1
                 processed_events[addr] = set()
-                print(f"[SERVER] New client {addr} -> player_id {next_player_id}")
-                next_player_id += 1
             else:
                 print(f"[SERVER] Existing client re-joined: {addr}")
 
             player_id = players[addr]
+            client_last_seen[addr] = current_millis()
 
             # send JOIN_ACK with assigned player_id
             ack_payload = struct.pack("!B", player_id)
@@ -247,6 +262,24 @@ def handle_client_messages(sock):
             except ValueError as e:
                 print(f"[SERVER] Bad EVENT from {addr}: {e}")
                 continue
+
+            # Update last seen timestamp (heartbeat)
+            client_last_seen[addr] = current_millis()
+
+            # If client was timed out or unknown, re-register it with same player_id
+            if addr not in players:
+                clients.add(addr)
+                # Restore player_id from history if available
+                if addr in player_id_history:
+                    players[addr] = player_id_history[addr]
+                    print(f"[SERVER] Client {addr} reconnected (was timed out) -> restoring player_id {players[addr]}")
+                else:
+                    # Brand new client (shouldn't happen normally)
+                    players[addr] = next_player_id
+                    player_id_history[addr] = next_player_id
+                    print(f"[SERVER] New client {addr} (via EVENT) -> player_id {next_player_id}")
+                    next_player_id += 1
+                processed_events[addr] = set()
 
             ev_id = ev["event_id"]
             player_id = players.get(addr, -1)
@@ -280,6 +313,35 @@ def handle_client_messages(sock):
         # other msg types can be handled later
 
 
+def cleanup_dead_clients():
+    """
+    Periodically check for clients that haven't sent any message
+    (JOIN, EVENT, etc.) within CLIENT_TIMEOUT_MS.
+    Removes them from clients, players, and processed_events.
+    """
+    print(f"[SERVER] Client cleanup thread started (timeout={CLIENT_TIMEOUT_MS}ms, interval={CLEANUP_INTERVAL_S}s)")
+    
+    while True:
+        time.sleep(CLEANUP_INTERVAL_S)
+        
+        now = current_millis()
+        dead_clients = []
+        
+        for addr in list(clients):
+            last_seen = client_last_seen.get(addr, now)
+            age_ms = now - last_seen
+            
+            if age_ms > CLIENT_TIMEOUT_MS:
+                dead_clients.append(addr)
+        
+        for addr in dead_clients:
+            clients.discard(addr)
+            player_id = players.pop(addr, None)
+            processed_events.pop(addr, None)
+            client_last_seen.pop(addr, None)
+            print(f"[SERVER] Client {addr} (player {player_id}) timed out after {CLIENT_TIMEOUT_MS}ms")
+
+
 def broadcast_snapshots(sock):
     """
     Periodically sends SNAPSHOT packets to all connected clients.
@@ -309,11 +371,12 @@ def broadcast_snapshots(sock):
         packet = hdr + payload
 
         # redundancy factor = 2
-        for _ in range(2):
-            for c in clients:
+        current_clients = list(clients)
+        for _ in range(2):  # redundancy factor = 2
+            for c in current_clients:
                 sock.sendto(packet, c)
 
-        log_snapshot(snapshot_id, len(clients))
+        log_snapshot(snapshot_id, len(current_clients))
 
 
 def main():
@@ -326,6 +389,10 @@ def main():
     # Thread to handle incoming messages
     t = threading.Thread(target=handle_client_messages, args=(sock,), daemon=True)
     t.start()
+
+    # Thread to cleanup dead clients
+    cleanup_thread = threading.Thread(target=cleanup_dead_clients, daemon=True)
+    cleanup_thread.start()
 
     # Main thread does broadcasting
     broadcast_snapshots(sock)
