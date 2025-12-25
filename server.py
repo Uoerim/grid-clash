@@ -41,7 +41,7 @@ GRID_SIZE = 20          # 20x20 grid
 CLIENT_TIMEOUT_MS = 15000   # 15 seconds without heartbeat to mark client offline
 CLEANUP_INTERVAL_S = 1    # Check for dead clients every 1 second
 
-LOG_DIR = "logs"
+LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 SERVER_CSV = os.path.join(LOG_DIR, "server_metrics.csv")
 SERVER_EVENTS_CSV = os.path.join(LOG_DIR, "server_events.csv")

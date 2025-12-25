@@ -16,6 +16,8 @@ import threading
 import time
 import csv
 import os
+import argparse, sys
+
 
 from protocol import (
     MsgType,
@@ -35,7 +37,7 @@ SERVER_PORT = 50000
 RETRY_INTERVAL_MS = 200
 MAX_RETRIES = 3
 
-LOG_DIR = "logs"
+LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -248,6 +250,11 @@ def send_acquire_request(sock, state, row, col):
 
 # ---------- Main ----------
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--duration", type=int, default=0)
+    args = parser.parse_args()
+
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 0))
 
@@ -275,6 +282,16 @@ def main():
 
     t_retry = threading.Thread(target=retry_loop, args=(sock, state), daemon=True)
     t_retry.start()
+
+    if args.duration > 0:
+        time.sleep(args.duration)
+        sock.close()
+        return
+
+    if not sys.stdin.isatty():
+        while True:
+            time.sleep(1)
+
 
     print("[CLIENT] Type: row col   to acquire a cell")
     print("[CLIENT] Type: q         to quit")
